@@ -22,8 +22,10 @@ use std::error::Error;
 use hashbrown::{HashMap, HashSet};
 
 use crate::archetype::Archetype;
+use crate::entities::{Entities, EntityMeta};
 use crate::{
-    Bundle, DynamicBundle, EntityRef, Fetch, MissingComponent, Query, QueryBorrow, Ref, RefMut,
+    Bundle, DynamicBundle, Entity, EntityRef, Fetch, MissingComponent, NoSuchEntity, Query, QueryBorrow,
+    Ref, RefMut,
 };
 
 /// An unordered collection of entities, each having any number of distinctly typed components
@@ -51,8 +53,10 @@ impl World {
     /// Returns the ID of the newly created entity.
     ///
     /// Arguments can be tuples, structs annotated with `#[derive(Bundle)]`, or `EntityBuilder`,
-    /// preferred if the set of components isn't statically known. To spawn an entity with only one
-    /// component, use a one-element tuple like `(x,)`.
+    /// which is useful if the set of components isn't statically known. To spawn an entity with
+    /// only one component, use a one-element tuple like `(x,)`.
+    ///
+    /// Any type that satisfies `Send + Sync + 'static` can be used as a component.
     ///
     /// # Example
     /// ```
@@ -118,6 +122,9 @@ impl World {
     ///
     /// Entities are yielded in arbitrary order.
     ///
+    /// The returned `QueryBorrow` can be further transformed with combinator methods; see its
+    /// documentation for details.
+    ///
     /// Iterating a query will panic if it would violate an existing unique reference or construct
     /// an invalid unique reference. This occurs when two simultaneously-active queries could expose
     /// the same entity. Simultaneous queries can access the same component type if and only if the
@@ -152,48 +159,24 @@ impl World {
     /// Panics if the component is already uniquely borrowed from another entity with the same
     /// components.
     pub fn get<T: Component>(&self, entity: Entity) -> Result<Ref<'_, T>, ComponentError> {
-        let meta = &self.entities.meta[entity.id as usize];
-        if meta.generation != entity.generation {
-            return Err(ComponentError::NoSuchEntity);
-        }
-        Ok(unsafe {
-            Ref::new(
-                &self.archetypes[meta.location.archetype as usize],
-                meta.location.index,
-            )?
-        })
+        let loc = self.entities.get(entity)?;
+        Ok(unsafe { Ref::new(&self.archetypes[loc.archetype as usize], loc.index)? })
     }
 
     /// Uniquely borrow the `T` component of `entity`
     ///
     /// Panics if the component is already borrowed from another entity with the same components.
     pub fn get_mut<T: Component>(&self, entity: Entity) -> Result<RefMut<'_, T>, ComponentError> {
-        let meta = &self.entities.meta[entity.id as usize];
-        if meta.generation != entity.generation {
-            return Err(ComponentError::NoSuchEntity);
-        }
-        Ok(unsafe {
-            RefMut::new(
-                &self.archetypes[meta.location.archetype as usize],
-                meta.location.index,
-            )?
-        })
+        let loc = self.entities.get(entity)?;
+        Ok(unsafe { RefMut::new(&self.archetypes[loc.archetype as usize], loc.index)? })
     }
 
     /// Access an entity regardless of its component types
     ///
     /// Does not immediately borrow any component.
     pub fn entity(&self, entity: Entity) -> Result<EntityRef<'_>, NoSuchEntity> {
-        let meta = &self.entities.meta[entity.id as usize];
-        if meta.generation != entity.generation {
-            return Err(NoSuchEntity);
-        }
-        Ok(unsafe {
-            EntityRef::new(
-                &self.archetypes[meta.location.archetype as usize],
-                meta.location.index,
-            )
-        })
+        let loc = self.entities.get(entity)?;
+        Ok(unsafe { EntityRef::new(&self.archetypes[loc.archetype as usize], loc.index) })
     }
 
     /// Iterate over all entities in the world
@@ -371,6 +354,43 @@ impl World {
         self.remove::<(T,)>(entity).map(|(x,)| x)
     }
 
+    /// Borrow the `T` component of `entity` without safety checks
+    ///
+    /// Should only be used as a building block for safe abstractions.
+    ///
+    /// # Safety
+    ///
+    /// `entity` must have been previously obtained from this `World`, and no unique borrow of the
+    /// same component of `entity` may be live simultaneous to the returned reference.
+    pub unsafe fn get_unchecked<T: Component>(&self, entity: Entity) -> Result<&T, ComponentError> {
+        let loc = self.entities.get(entity)?;
+        Ok(&*self.archetypes[loc.archetype as usize]
+            .get::<T>()
+            .ok_or_else(MissingComponent::new::<T>)?
+            .as_ptr()
+            .add(loc.index as usize))
+    }
+
+    /// Uniquely borrow the `T` component of `entity` without safety checks
+    ///
+    /// Should only be used as a building block for safe abstractions.
+    ///
+    /// # Safety
+    ///
+    /// `entity` must have been previously obtained from this `World`, and no borrow of the same
+    /// component of `entity` may be live simultaneous to the returned reference.
+    pub unsafe fn get_unchecked_mut<T: Component>(
+        &self,
+        entity: Entity,
+    ) -> Result<&mut T, ComponentError> {
+        let loc = self.entities.get(entity)?;
+        Ok(&mut *self.archetypes[loc.archetype as usize]
+            .get::<T>()
+            .ok_or_else(MissingComponent::new::<T>)?
+            .as_ptr()
+            .add(loc.index as usize))
+    }
+
     /// Determine which collections of entities will be borrowed by `Q`
     ///
     /// The returned identifiers are invalidated when any entity or component is added or removed.
@@ -433,59 +453,12 @@ impl From<MissingComponent> for ComponentError {
     }
 }
 
-/// Error indicating that no entity with a particular ID exists
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NoSuchEntity;
-
-impl fmt::Display for NoSuchEntity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("no such entity")
-    }
-}
-
-#[cfg(feature = "std")]
-impl Error for NoSuchEntity {}
-
-/// Types that can be components (implemented automatically)
+/// Types that can be components, implemented automatically for all `Send + Sync + 'static` types
+///
+/// This is just a convenient shorthand for `Send + Sync + 'static`, and never needs to be
+/// implemented manually.
 pub trait Component: Send + Sync + 'static {}
 impl<T: Send + Sync + 'static> Component for T {}
-
-/// Lightweight unique ID of an entity
-///
-/// Obtained from `World::spawn`. Can be stored to refer to an entity in the future.
-#[derive(Clone, Copy, Hash, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Entity {
-    pub(crate) generation: u32,
-    pub(crate) id: u32,
-}
-
-impl Entity {
-    /// Convert to a form convenient for passing outside of rust
-    ///
-    /// Only useful for identifying entities within the same instance of an application. Do not use
-    /// for serialization between runs.
-    ///
-    /// No particular structure is guaranteed for the returned bits.
-    pub fn to_bits(self) -> u64 {
-        u64::from(self.generation) << 32 | u64::from(self.id)
-    }
-
-    /// Reconstruct an `Entity` previously destructured with `to_bits`
-    ///
-    /// Only useful when applied to results from `to_bits` in the same instance of an application.
-    pub fn from_bits(bits: u64) -> Self {
-        Self {
-            generation: (bits >> 32) as u32,
-            id: bits as u32,
-        }
-    }
-}
-
-impl fmt::Debug for Entity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}v{}", self.id, self.generation)
-    }
-}
 
 /// Iterator over all of a world's entities
 pub struct Iter<'a> {
@@ -562,72 +535,6 @@ impl<A: DynamicBundle> core::iter::FromIterator<A> for World {
     }
 }
 
-#[derive(Default)]
-struct Entities {
-    meta: Vec<EntityMeta>,
-    free: Vec<u32>,
-}
-
-impl Entities {
-    fn alloc(&mut self) -> Entity {
-        match self.free.pop() {
-            Some(i) => Entity {
-                generation: self.meta[i as usize].generation,
-                id: i,
-            },
-            None => {
-                let i = self.meta.len() as u32;
-                self.meta.push(EntityMeta {
-                    generation: 0,
-                    location: Location {
-                        archetype: 0,
-                        index: 0,
-                    },
-                });
-                Entity {
-                    generation: 0,
-                    id: i,
-                }
-            }
-        }
-    }
-
-    fn free(&mut self, entity: Entity) -> Result<Location, NoSuchEntity> {
-        let meta = &mut self.meta[entity.id as usize];
-        if meta.generation != entity.generation {
-            return Err(NoSuchEntity);
-        }
-        meta.generation += 1;
-        self.free.push(entity.id);
-        Ok(meta.location)
-    }
-
-    fn clear(&mut self) {
-        self.meta.clear();
-        self.free.clear();
-    }
-
-    fn get_mut(&mut self, entity: Entity) -> Result<&mut Location, NoSuchEntity> {
-        let meta = &mut self.meta[entity.id as usize];
-        if meta.generation != entity.generation {
-            return Err(NoSuchEntity);
-        }
-        Ok(&mut meta.location)
-    }
-}
-
-#[derive(Copy, Clone)]
-pub(crate) struct EntityMeta {
-    pub(crate) generation: u32,
-    location: Location,
-}
-
-#[derive(Copy, Clone)]
-struct Location {
-    archetype: u32,
-    index: u32,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,14 +547,5 @@ mod tests {
         let b = world.spawn(());
         assert_eq!(a.id, b.id);
         assert_ne!(a.generation, b.generation);
-    }
-
-    #[test]
-    fn entity_bits_roundtrip() {
-        let e = Entity {
-            generation: 0xDEADBEEF,
-            id: 0xBAADF00D,
-        };
-        assert_eq!(Entity::from_bits(e.to_bits()), e);
     }
 }

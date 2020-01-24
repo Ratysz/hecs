@@ -27,8 +27,10 @@
 //! ```
 //! # use hecs::*;
 //! let mut world = World::new();
+//! // Nearly any type can be used as a component with zero boilerplate
 //! let a = world.spawn((123, true, "abc"));
 //! let b = world.spawn((42, false));
+//! // Systems can be simple for loops
 //! for (id, (number, &flag)) in &mut world.query::<(&mut i32, &bool)>() {
 //!   if flag { *number *= 2; }
 //! }
@@ -62,15 +64,17 @@ macro_rules! smaller_tuples_too {
 mod archetype;
 mod borrow;
 mod bundle;
+mod entities;
 mod entity_builder;
 mod query;
 mod world;
 
 pub use borrow::{EntityRef, Ref, RefMut};
 pub use bundle::{Bundle, DynamicBundle, MissingComponent};
+pub use entities::{Entity, NoSuchEntity};
 pub use entity_builder::{BuiltEntity, EntityBuilder};
 pub use query::{Query, QueryBorrow, QueryIter, With, Without};
-pub use world::{Component, ComponentError, Entity, Iter, NoSuchEntity, World};
+pub use world::{Component, ComponentError, Iter, World};
 
 // Unstable implementation details needed by the macros
 #[doc(hidden)]
